@@ -1246,10 +1246,26 @@ static int64_t default_reload_interval(struct playlist *pls)
 static int read_data(void *opaque, uint8_t *buf, int buf_size)
 {
     struct playlist *v = opaque;
-    int ret;
+    HLSContext *c = v->parent->priv_data;
+    int ret, just_opened = 0;
+    struct segment *seg = current_segment(v);
 
-    if (!v->input)
-        return AVERROR_EOF;
+    if (!v->input) {
+        /* load/update Media Initialization Section, if any */
+        ret = update_init_section(v, seg);
+        if (ret < 0)
+            return ret;
+
+        ret = open_input(c, v, seg);
+        if (ret < 0) {
+            if (ff_check_interrupt(c->interrupt_callback))
+                return AVERROR_EXIT;
+            av_log(v->parent, AV_LOG_WARNING, "Failed to open segment of playlist %d\n",
+                   v->index);
+            return ret;
+        }
+        just_opened = 1;
+    }
 
     if (v->init_sec_buf_read_offset < v->init_sec_data_len) {
         /* Push init section out first before first actual segment */
@@ -1259,16 +1275,15 @@ static int read_data(void *opaque, uint8_t *buf, int buf_size)
         return copy_size;
     }
 
-    ret = read_from_url(v, current_segment(v), buf, buf_size, READ_NORMAL);
+    ret = read_from_url(v, seg, buf, buf_size, READ_NORMAL);
     if (ret > 0) {
-        if (v->just_opened_segment && v->is_id3_timestamped != 0) {
+        if (just_opened && v->is_id3_timestamped != 0) {
             /* Intercept ID3 tags here, elementary audio streams are required
              * to convey timestamps using them in the beginning of each segment. */
             intercept_id3(v, buf, buf_size, &ret);
         }
     }
 
-    v->just_opened_segment = 0;
     return ret;
 }
 
@@ -1319,77 +1334,6 @@ static int init_subtitle_context(struct playlist *pls)
     return ret;
 }
 
-static int open_playlist(struct playlist *v)
-{
-    HLSContext *c = v->parent->priv_data;
-    int ret;
-    int64_t reload_interval;
-    struct segment *seg;
-
-    /* If this is a live stream and the reload interval has elapsed since
-    * the last playlist reload, reload the playlists now. */
-    reload_interval = default_reload_interval(v);
-
-reload:
-    if (!v->finished &&
-        av_gettime_relative() - v->last_load_time >= reload_interval) {
-        if ((ret = parse_playlist(c, v->url, v, NULL)) < 0) {
-            av_log(v->parent, AV_LOG_WARNING, "Failed to reload playlist %d\n",
-                   v->index);
-            return ret;
-        }
-        /* If we need to reload the playlist again below (if
-         * there's still no more segments), switch to a reload
-         * interval of half the target duration. */
-        reload_interval = v->target_duration / 2;
-    }
-    if (v->cur_seq_no < v->start_seq_no) {
-        av_log(NULL, AV_LOG_WARNING,
-               "skipping %d segments ahead, expired from playlists\n",
-               v->start_seq_no - v->cur_seq_no);
-        v->cur_seq_no = v->start_seq_no;
-    }
-    if (v->cur_seq_no >= v->start_seq_no + v->n_segments) {
-        if (v->finished || v->is_subtitle)
-            return AVERROR_EOF;
-        while (av_gettime_relative() - v->last_load_time < reload_interval) {
-            if (ff_check_interrupt(c->interrupt_callback))
-                return AVERROR_EXIT;
-            av_usleep(100*1000);
-        }
-        /* Enough time has elapsed since the last reload */
-        goto reload;
-    }
-
-    seg = current_segment(v);
-
-    if (!v->ctx && v->is_subtitle) {
-        ret = init_subtitle_context(v);
-        if (ret)
-            return ret;
-    }
-
-    /* load/update Media Initialization Section, if any */
-    ret = update_init_section(v, seg);
-    if (ret)
-        return ret;
-
-    ret = open_input(c, v, seg);
-    if (ret < 0) {
-        if (ff_check_interrupt(c->interrupt_callback))
-            return AVERROR_EXIT;
-        av_log(v->parent, AV_LOG_WARNING, "Failed to open segment of playlist %d\n",
-               v->index);
-        v->cur_seq_no += 1;
-        if (v->is_subtitle)
-            avformat_close_input(&v->ctx);
-        goto reload;
-    }
-    v->just_opened_segment = 1;
-
-    return ret;
-}
-
 static int read_packet(struct playlist *v, AVPacket *pkt)
 {
     HLSContext *c = v->parent->priv_data;
@@ -1400,6 +1344,8 @@ restart:
         return AVERROR_EOF;
 
     if (!v->input) {
+        int64_t reload_interval;
+
         /* Check that the playlist is still needed before opening a new
          * segment. */
         if (v->ctx && v->ctx->nb_streams) {
@@ -1418,9 +1364,46 @@ restart:
             return AVERROR_EOF;
         }
 
-        ret = open_playlist(v);
-        if (ret)
-            return ret;
+        /* If this is a live stream and the reload interval has elapsed since
+        * the last playlist reload, reload the playlists now. */
+        reload_interval = default_reload_interval(v);
+
+reload:
+        if (!v->finished &&
+            av_gettime_relative() - v->last_load_time >= reload_interval) {
+            if ((ret = parse_playlist(c, v->url, v, NULL)) < 0) {
+                av_log(v->parent, AV_LOG_WARNING, "Failed to reload playlist %d\n",
+                       v->index);
+                return ret;
+            }
+            /* If we need to reload the playlist again below (if
+             * there's still no more segments), switch to a reload
+             * interval of half the target duration. */
+            reload_interval = v->target_duration / 2;
+        }
+        if (v->cur_seq_no < v->start_seq_no) {
+            av_log(NULL, AV_LOG_WARNING,
+                   "skipping %d segments ahead, expired from playlists\n",
+                   v->start_seq_no - v->cur_seq_no);
+            v->cur_seq_no = v->start_seq_no;
+        }
+        if (v->cur_seq_no >= v->start_seq_no + v->n_segments) {
+            if (v->finished || v->is_subtitle)
+                return AVERROR_EOF;
+            while (av_gettime_relative() - v->last_load_time < reload_interval) {
+                if (ff_check_interrupt(c->interrupt_callback))
+                    return AVERROR_EXIT;
+                av_usleep(100*1000);
+            }
+            /* Enough time has elapsed since the last reload */
+            goto reload;
+        }
+
+        if (!v->ctx && v->is_subtitle) {
+            ret = init_subtitle_context(v);
+            if (ret < 0)
+                return ret;
+        }
     }
 
     ret = av_read_frame(v->ctx, &v->pkt);
@@ -1829,11 +1812,6 @@ static int hls_read_header(AVFormatContext *s)
         ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
                           read_data, NULL, NULL);
         pls->pb.seekable = 0;
-
-        if (open_playlist(pls)) {
-            av_log(s, AV_LOG_ERROR, "Error when loading first segment '%s'\n", pls->segments[0]->url);
-            goto fail;
-        }
 
         ret = av_probe_input_buffer(&pls->pb, &in_fmt, pls->segments[0]->url,
                                     NULL, 0, 0);
