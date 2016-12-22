@@ -1411,6 +1411,8 @@ reload:
         }
     }
 
+    /* EOF flag may get set when the end of a segment is reached */
+    v->pb.eof_reached = 0;
     ret = av_read_frame(v->ctx, &v->pkt);
     if (!ret) {
         return ret;
