@@ -1839,7 +1839,7 @@ static int hls_read_header(AVFormatContext *s)
             goto fail;
 
         av_dict_copy(&opts, c->demuxer_opts, 0);
-        ret = avformat_open_input(&pls->ctx, pls->segments[0]->url, in_fmt, NULL);
+        ret = avformat_open_input(&pls->ctx, pls->segments[0]->url, in_fmt, &opts);
         av_dict_free(&opts);
         if (ret < 0)
             goto fail;
