@@ -155,7 +155,6 @@ struct playlist {
     struct segment **init_sections;
 
     int is_subtitle; /* Indicates if it's a subtitle playlist */
-    int just_opened_segment;
 };
 
 /*
@@ -1248,7 +1247,13 @@ static int read_data(void *opaque, uint8_t *buf, int buf_size)
     struct playlist *v = opaque;
     HLSContext *c = v->parent->priv_data;
     int ret, just_opened = 0;
-    struct segment *seg = current_segment(v);
+    struct segment *seg;
+
+    if (v->cur_seq_no - v->start_seq_no >= v->n_segments) {
+        return AVERROR_EOF;
+    } else {
+        seg = current_segment(v);
+    }
 
     if (!v->input) {
         /* load/update Media Initialization Section, if any */
