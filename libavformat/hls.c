@@ -1353,7 +1353,7 @@ restart:
 
         /* Check that the playlist is still needed before opening a new
          * segment. */
-        if (v->ctx && v->ctx->nb_streams) {
+        if ((v->ctx && v->ctx->nb_streams) || v->is_subtitle) {
             int i;
             v->needed = 0;
             for (i = 0; i < v->n_main_streams; i++) {
