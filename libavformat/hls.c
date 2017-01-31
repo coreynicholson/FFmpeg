@@ -1242,109 +1242,10 @@ static int64_t default_reload_interval(struct playlist *pls)
                           pls->target_duration;
 }
 
-static int read_data(void *opaque, uint8_t *buf, int buf_size)
+static int reload_playlist(struct playlist *v, HLSContext *c)
 {
-    struct playlist *v = opaque;
-    HLSContext *c = v->parent->priv_data;
-    int ret, just_opened = 0;
-    struct segment *seg;
-
-    if (v->cur_seq_no - v->start_seq_no >= v->n_segments) {
-        return AVERROR_EOF;
-    } else {
-        seg = current_segment(v);
-    }
-
-    if (!v->input) {
-        /* load/update Media Initialization Section, if any */
-        ret = update_init_section(v, seg);
-        if (ret < 0)
-            return ret;
-
-        ret = open_input(c, v, seg);
-        if (ret < 0) {
-            if (ff_check_interrupt(c->interrupt_callback))
-                return AVERROR_EXIT;
-            av_log(v->parent, AV_LOG_WARNING, "Failed to open segment of playlist %d\n",
-                   v->index);
-            return ret;
-        }
-        just_opened = 1;
-    }
-
-    if (v->init_sec_buf_read_offset < v->init_sec_data_len) {
-        /* Push init section out first before first actual segment */
-        int copy_size = FFMIN(v->init_sec_data_len - v->init_sec_buf_read_offset, buf_size);
-        memcpy(buf, v->init_sec_buf, copy_size);
-        v->init_sec_buf_read_offset += copy_size;
-        return copy_size;
-    }
-
-    ret = read_from_url(v, seg, buf, buf_size, READ_NORMAL);
-    if (ret > 0) {
-        if (just_opened && v->is_id3_timestamped != 0) {
-            /* Intercept ID3 tags here, elementary audio streams are required
-             * to convey timestamps using them in the beginning of each segment. */
-            intercept_id3(v, buf, buf_size, &ret);
-        }
-    }
-
-    return ret;
-}
-
-static int nested_io_open(AVFormatContext *s, AVIOContext **pb, const char *url,
-                          int flags, AVDictionary **opts)
-{
-    av_log(s, AV_LOG_ERROR,
-           "A HLS playlist item '%s' referred to an external file '%s'. "
-           "Opening this file was forbidden for security reasons\n",
-           s->filename, url);
-    return AVERROR(EPERM);
-}
-
-static int init_subtitle_context(struct playlist *pls)
-{
-    HLSContext *c = pls->parent->priv_data;
-    AVInputFormat *in_fmt;
-    AVDictionary *opts = NULL;
     int ret = 0;
 
-    if (!(pls->ctx = avformat_alloc_context()))
-        return AVERROR(ENOMEM);
-
-    pls->read_buffer = av_malloc(INITIAL_BUFFER_SIZE);
-    if (!pls->read_buffer) {
-        avformat_free_context(pls->ctx);
-        pls->ctx = NULL;
-        return AVERROR(ENOMEM);
-    }
-
-    ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
-                      read_data, NULL, NULL);
-    pls->pb.seekable = 0;
-    pls->ctx->pb = &pls->pb;
-    pls->ctx->io_open = nested_io_open;
-
-    ret = ff_copy_whiteblacklists(pls->ctx, pls->parent);
-    if (ret < 0)
-        return ret;
-
-    in_fmt = av_find_input_format("webvtt");
-    av_dict_copy(&opts, c->demuxer_opts, 0);
-    ret = avformat_open_input(&pls->ctx, current_segment(pls)->url, in_fmt, &opts);
-    av_dict_free(&opts);
-    if (ret < 0)
-        return ret;
-
-    return ret;
-}
-
-static int read_packet(struct playlist *v, AVPacket *pkt)
-{
-    HLSContext *c = v->parent->priv_data;
-    int ret;
-
-restart:
     if (!v->needed)
         return AVERROR_EOF;
 
@@ -1403,16 +1304,157 @@ reload:
             /* Enough time has elapsed since the last reload */
             goto reload;
         }
+    }
 
-        if (!v->ctx && v->is_subtitle) {
-            ret = init_subtitle_context(v);
-            if (ret < 0)
-                return ret;
+    return ret;
+}
+
+static int read_data_continuous(void *opaque, uint8_t *buf, int buf_size)
+{
+    struct playlist *v = opaque;
+    HLSContext *c = v->parent->priv_data;
+    int ret, just_opened = 0;
+    struct segment *seg;
+
+reload:
+    ret = reload_playlist(v, c);
+    if (ret < 0)
+        return ret;
+    seg = current_segment(v);
+
+    if (!v->input) {
+        /* load/update Media Initialization Section, if any */
+        ret = update_init_section(v, seg);
+        if (ret < 0)
+            return ret;
+
+        ret = open_input(c, v, seg);
+        if (ret < 0) {
+            if (ff_check_interrupt(c->interrupt_callback))
+                return AVERROR_EXIT;
+            av_log(v->parent, AV_LOG_WARNING, "Failed to open segment of playlist %d\n",
+                   v->index);
+            v->cur_seq_no += 1;
+            goto reload;
+        }
+        just_opened = 1;
+    }
+
+    if (v->init_sec_buf_read_offset < v->init_sec_data_len) {
+        /* Push init section out first before first actual segment */
+        int copy_size = FFMIN(v->init_sec_data_len - v->init_sec_buf_read_offset, buf_size);
+        memcpy(buf, v->init_sec_buf, copy_size);
+        v->init_sec_buf_read_offset += copy_size;
+        return copy_size;
+    }
+
+    ret = read_from_url(v, seg, buf, buf_size, READ_NORMAL);
+    if (ret > 0) {
+        if (just_opened && v->is_id3_timestamped != 0) {
+            /* Intercept ID3 tags here, elementary audio streams are required
+             * to convey timestamps using them in the beginning of each segment. */
+            intercept_id3(v, buf, buf_size, &ret);
+        }
+
+        return ret;
+    }
+    ff_format_io_close(v->parent, &v->input);
+    v->cur_seq_no++;
+    c->cur_seq_no = v->cur_seq_no;
+
+    goto reload;
+}
+
+static int read_data_subtitle_segment(void *opaque, uint8_t *buf, int buf_size)
+{
+    struct playlist *v = opaque;
+    HLSContext *c = v->parent->priv_data;
+    int ret;
+    struct segment *seg;
+
+    if (v->cur_seq_no - v->start_seq_no >= v->n_segments) {
+        return AVERROR_EOF;
+    } else {
+        seg = current_segment(v);
+    }
+
+    if (!v->input) {
+        ret = open_input(c, v, seg);
+        if (ret < 0) {
+            if (ff_check_interrupt(c->interrupt_callback))
+                return AVERROR_EXIT;
+            av_log(v->parent, AV_LOG_WARNING, "Failed to open segment of playlist %d\n",
+                   v->index);
+            return ret;
         }
     }
 
-    /* EOF flag may get set when the end of a segment is reached */
-    v->pb.eof_reached = 0;
+    return read_from_url(v, seg, buf, buf_size, READ_NORMAL);
+}
+
+static int nested_io_open(AVFormatContext *s, AVIOContext **pb, const char *url,
+                          int flags, AVDictionary **opts)
+{
+    av_log(s, AV_LOG_ERROR,
+           "A HLS playlist item '%s' referred to an external file '%s'. "
+           "Opening this file was forbidden for security reasons\n",
+           s->filename, url);
+    return AVERROR(EPERM);
+}
+
+static int init_subtitle_context(struct playlist *pls)
+{
+    HLSContext *c = pls->parent->priv_data;
+    AVInputFormat *in_fmt;
+    AVDictionary *opts = NULL;
+    int ret = 0;
+
+    if (!(pls->ctx = avformat_alloc_context()))
+        return AVERROR(ENOMEM);
+
+    pls->read_buffer = av_malloc(INITIAL_BUFFER_SIZE);
+    if (!pls->read_buffer) {
+        avformat_free_context(pls->ctx);
+        pls->ctx = NULL;
+        return AVERROR(ENOMEM);
+    }
+
+    ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
+                      read_data_subtitle_segment, NULL, NULL);
+    pls->pb.seekable = 0;
+    pls->ctx->pb = &pls->pb;
+    pls->ctx->io_open = nested_io_open;
+
+    ret = ff_copy_whiteblacklists(pls->ctx, pls->parent);
+    if (ret < 0)
+        return ret;
+
+    in_fmt = av_find_input_format("webvtt");
+    av_dict_copy(&opts, c->demuxer_opts, 0);
+    ret = avformat_open_input(&pls->ctx, current_segment(pls)->url, in_fmt, &opts);
+    av_dict_free(&opts);
+    if (ret < 0)
+        return ret;
+
+    return ret;
+}
+
+static int read_subtitle_packet(struct playlist *v, AVPacket *pkt)
+{
+    HLSContext *c = v->parent->priv_data;
+    int ret;
+
+restart:
+    ret = reload_playlist(v, c);
+    if (ret < 0)
+        return ret;
+
+    if (!v->input && !v->ctx) {
+        ret = init_subtitle_context(v);
+        if (ret < 0)
+            return ret;
+    }
+
     ret = av_read_frame(v->ctx, &v->pkt);
     if (!ret) {
         return ret;
@@ -1421,8 +1463,7 @@ reload:
     v->cur_seq_no++;
     c->cur_seq_no = v->cur_seq_no;
 
-    if (v->is_subtitle)
-        avformat_close_input(&v->ctx);
+    avformat_close_input(&v->ctx);
 
     goto restart;
 }
@@ -1816,8 +1857,12 @@ static int hls_read_header(AVFormatContext *s)
             pls->ctx = NULL;
             goto fail;
         }
-        ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
-                          read_data, NULL, NULL);
+        if (pls->is_subtitle)
+            ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
+                                      read_data_subtitle_segment, NULL, NULL);
+        else
+            ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
+                                      read_data_continuous, NULL, NULL);
         pls->pb.seekable = 0;
 
         ret = av_probe_input_buffer(&pls->pb, &in_fmt, pls->segments[0]->url,
@@ -1986,7 +2031,10 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
             while (1) {
                 int64_t ts_diff;
                 AVRational tb;
-                ret = read_packet(pls, &pls->pkt);
+                if (pls->is_subtitle)
+                    ret = read_subtitle_packet(pls, &pls->pkt);
+                else
+                    ret = av_read_frame(pls->ctx, &pls->pkt);
                 if (ret < 0) {
                     if (!avio_feof(&pls->pb) && ret != AVERROR_EOF)
                         return ret;
