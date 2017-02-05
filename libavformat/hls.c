@@ -1316,7 +1316,7 @@ static int read_data_continuous(void *opaque, uint8_t *buf, int buf_size)
     int ret, just_opened = 0;
     struct segment *seg;
 
-reload:
+restart:
     ret = reload_playlist(v, c);
     if (ret < 0)
         return ret;
@@ -1335,7 +1335,7 @@ reload:
             av_log(v->parent, AV_LOG_WARNING, "Failed to open segment of playlist %d\n",
                    v->index);
             v->cur_seq_no += 1;
-            goto reload;
+            goto restart;
         }
         just_opened = 1;
     }
@@ -1362,7 +1362,7 @@ reload:
     v->cur_seq_no++;
     c->cur_seq_no = v->cur_seq_no;
 
-    goto reload;
+    goto restart;
 }
 
 static int read_data_subtitle_segment(void *opaque, uint8_t *buf, int buf_size)
@@ -1372,7 +1372,7 @@ static int read_data_subtitle_segment(void *opaque, uint8_t *buf, int buf_size)
     int ret;
     struct segment *seg;
 
-    if (v->cur_seq_no - v->start_seq_no >= v->n_segments) {
+    if (!v->needed || v->cur_seq_no - v->start_seq_no >= v->n_segments) {
         return AVERROR_EOF;
     } else {
         seg = current_segment(v);
@@ -1433,8 +1433,6 @@ static int init_subtitle_context(struct playlist *pls)
     av_dict_copy(&opts, c->demuxer_opts, 0);
     ret = avformat_open_input(&pls->ctx, current_segment(pls)->url, in_fmt, &opts);
     av_dict_free(&opts);
-    if (ret < 0)
-        return ret;
 
     return ret;
 }
